@@ -92,15 +92,32 @@ export interface StoreSettings {
   openHours: string;
 }
 
-export interface AttendanceRecord {
-  id: string;
-  staffName: string;
-  role: string;
+export type AttendanceStatus = 'Hadir' | 'Terlambat';
+
+export interface AttendanceSnapshot {
   date: string;
   checkInTime: string;
   checkOutTime?: string;
-  status: 'Hadir' | 'Izin' | 'Sakit' | 'Terlambat';
+  status: AttendanceStatus;
+}
+
+export interface AttendanceRecord extends AttendanceSnapshot {
+  id: string;
+  loginId: string;
+  staffName: string;
+  role: string;
   avatar?: string;
+  durationMinutes: number | null;
+}
+
+export interface AttendanceCorrection {
+  id: string;
+  attendanceId: string;
+  correctedBy: string;
+  before: AttendanceSnapshot;
+  after: AttendanceSnapshot;
+  reason: string;
+  correctedAt: string;
 }
 
 // Dashboard pages (URL segments). Lives here so shared access rules don't import from the frontend.

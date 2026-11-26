@@ -6,9 +6,19 @@
 //
 // Reads DATABASE_URL from backend/.env. Generated passwords are printed once and never stored in plain text.
 
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { generateTempPassword, hashPassword } from './utils/password-hash.js';
 import { INITIAL_MENU, INITIAL_STOCKS, INITIAL_STORE_SETTINGS } from './utils/seed-data.js';
+
+// The migration file is the single source of truth for the attendance correction schema.
+// init-db keeps working by applying it after the base schema, without duplicating the DDL here.
+const CORRECTIONS_MIGRATION = readFileSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), '../migrations/001_attendance_corrections.sql'),
+  'utf8'
+);
 
 const OWNER_ID = 'OWN-001';
 const OWNER_NAME = 'Owner Warkop Wong Kito';
@@ -179,6 +189,7 @@ const main = async () => {
 
   try {
     await client.query(SCHEMA);
+    await client.query(CORRECTIONS_MIGRATION);
     console.log('✓ Tabel akun, sesi, menu, stok, pesanan, pengaturan & absensi siap.');
     await seedStoreData(client);
 
