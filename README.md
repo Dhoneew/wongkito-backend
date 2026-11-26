@@ -26,7 +26,7 @@ Backend API untuk sistem manajemen Warkop Wong Kito (WKM). Service ini melayani 
 - **Stock/inventory**: Owner mengelola stok bahan baku; staf login dapat melihatnya.
 - **Orders/POS**: checkout menghitung harga, pajak, dan kembalian di server serta mengurangi stok menu dalam transaksi; status pesanan dapat diubah, pembatalan hanya oleh Owner.
 - **Team/staff**: Owner membuat, mengubah, menonaktifkan kasir, dan mereset password kasir.
-- **Attendance**: check-in/check-out kasir, lihat absensi, koreksi Owner, dan riwayat koreksi/audit trail.
+- **Attendance**: check-in/check-out kasir, daftar absensi dengan pagination server-side dan filter, ringkasan rekap, koreksi Owner, dan riwayat koreksi/audit trail.
 - **Dashboard & ringkasan**: penjualan hari ini, per jam, 7 hari terakhir, dan menu terlaris. Belum ada endpoint laporan terpisah.
 - **Settings**: pengaturan toko untuk nota/POS dan endpoint publik berisi informasi toko minimum.
 - **Notifications**: notifikasi dihitung dari data stok, menu, dan pesanan yang ada saat request diterima.
@@ -195,12 +195,76 @@ Base URL lokal adalah `http://localhost:4000`. Frontend memanggil endpoint denga
 
 | Method | Endpoint | Akses | Catatan |
 | --- | --- | --- | --- |
-| `GET` | `/api/attendance` | Login | Owner melihat semua; kasir hanya dirinya. Query `from`/`to` `YYYY-MM-DD`, default 30 hari |
+| `GET` | `/api/attendance` | Login | Daftar absensi dengan pagination server-side; lihat subsection di bawah |
+| `GET` | `/api/attendance/summary` | Login | Rekap dari seluruh data hasil filter, bukan halaman aktif |
 | `GET` | `/api/attendance/today` | Login | Absensi hari ini milik sendiri atau `null` |
 | `POST` | `/api/attendance/check-in` | Kasir | Check-in sekali per hari |
 | `POST` | `/api/attendance/check-out` | Kasir | Menutup absensi hari ini |
 | `GET` | `/api/attendance/:id/corrections` | Owner | Riwayat koreksi absensi |
 | `PATCH` | `/api/attendance/:id/correct` | Owner | Koreksi absensi disertai audit trail |
+
+#### Pagination dan filter absensi
+
+`GET /api/attendance` menerima parameter berikut:
+
+| Parameter | Default | Catatan |
+| --- | --- | --- |
+| `from` | 30 hari terakhir | Tanggal awal `YYYY-MM-DD`; harus valid dan tidak lebih besar dari `to` |
+| `to` | hari ini (`Asia/Jakarta`) | Tanggal akhir `YYYY-MM-DD` |
+| `page` | `1` | Halaman 1-based; harus `>= 1` |
+| `limit` | `10` | Jumlah data per halaman; rentang `1..100` |
+| `employee` | - | Filter nama karyawan atau login ID; **Owner only** |
+| `status` | - | `Hadir` atau `Terlambat`; **Owner only** |
+
+Owner melihat seluruh absensi yang lolos filter. Kasir hanya melihat absensinya sendiri: filter `login_id` diterapkan dari sesi dan tidak bisa diganti lewat query. Kasir yang mengirim `employee` atau `status` mendapat `403`.
+
+Contoh request:
+
+```text
+GET /api/attendance?from=2026-11-01&to=2026-11-27&page=2&limit=10&employee=KSR-002&status=Hadir
+```
+
+Contoh response:
+
+```json
+{
+  "attendance": [
+    {
+      "id": "att-0027",
+      "loginId": "KSR-002",
+      "staffName": "Sinta",
+      "role": "Kasir",
+      "date": "2026-11-20",
+      "checkInTime": "07:05",
+      "checkOutTime": "15:02",
+      "durationMinutes": 477,
+      "status": "Hadir"
+    }
+  ],
+  "pagination": {
+    "page": 2,
+    "limit": 10,
+    "total": 23,
+    "totalPages": 3
+  }
+}
+```
+
+Objek `pagination` berisi `page`, `limit`, `total` (jumlah seluruh data yang lolos filter), dan `totalPages`. `totalPages` bernilai `0` jika tidak ada data. Urutan data adalah `work_date DESC`, `check_in DESC`, `id DESC` agar stabil antar halaman.
+
+`GET /api/attendance/summary` memakai filter `from`, `to`, `employee`, dan `status` dengan aturan akses yang sama. Endpoint ini mengembalikan:
+
+```json
+{
+  "summary": {
+    "hadir": 8,
+    "terlambat": 2,
+    "total": 10
+  }
+}
+```
+
+Ringkasan dihitung dari **seluruh data hasil filter**, bukan dari 10 data halaman aktif. Kasir tetap hanya mendapat ringkasan absensinya sendiri.
 
 ### Dashboard
 
@@ -234,6 +298,8 @@ Respons error berbentuk `{ "error": "pesan" }`. Status yang umum digunakan antar
 ## Absensi dan koreksi Owner
 
 - Tanggal dan jam absensi memakai `Asia/Jakarta`. Check-in hanya sekali per hari; status hanya `Hadir` atau `Terlambat` dengan toleransi 15 menit setelah jam mulai shift yang tercantum pada akun kasir.
+- Daftar absensi memakai pagination server-side dengan `page` dan `limit` (default 10, maksimal 100); sorting memakai `work_date DESC`, `check_in DESC`, `id DESC` agar stabil antar halaman.
+- `GET /api/attendance/summary` menghitung `hadir`, `terlambat`, dan `total` dari seluruh data hasil filter, sehingga rekap tidak terpotong oleh halaman aktif.
 - Owner tidak dapat melakukan check-in/check-out; endpoint tersebut mengembalikan `403` untuk selain kasir.
 - Check-out memakai `UPDATE ... WHERE check_out IS NULL RETURNING` sehingga permintaan ganda tidak bisa menutup absensi dua kali.
 - Koreksi Owner (`PATCH /api/attendance/:id/correct`) berjalan dalam satu transaksi: baris absensi dikunci, snapshot `before` diambil, data diperbarui, snapshot `after` disimpan, lalu baris audit ditulis ke `attendance_corrections`.
