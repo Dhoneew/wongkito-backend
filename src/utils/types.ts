@@ -120,6 +120,30 @@ export interface AttendanceCorrection {
   correctedAt: string;
 }
 
+// Pagination metadata for GET /api/attendance. totalPages is 0 when there is no data.
+export interface AttendancePagination {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface AttendanceListResponse {
+  attendance: AttendanceRecord[];
+  pagination: AttendancePagination;
+}
+
+// Counts over the full filtered dataset, independent of the paginated list.
+export interface AttendanceSummary {
+  hadir: number;
+  terlambat: number;
+  total: number;
+}
+
+export interface AttendanceSummaryResponse {
+  summary: AttendanceSummary;
+}
+
 // Dashboard pages (URL segments). Lives here so shared access rules don't import from the frontend.
 export type DashboardTab =
   | 'dashboard'

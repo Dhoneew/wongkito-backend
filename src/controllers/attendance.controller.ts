@@ -2,8 +2,17 @@ import type { Request, Response } from 'express';
 import { isUniqueViolation, query, withTransaction } from '../db.js';
 import { isOwner, sessionOf } from '../middleware/auth.middleware.js';
 import { ROLE_LABEL, roleFromLoginId } from '../utils/access.js';
-import { HttpError, optionalDate, param, readBody, requireOneOf, requireString } from '../utils/http.js';
-import type { AttendanceCorrection, AttendanceRecord, AttendanceSnapshot } from '../utils/types.js';
+import { HttpError, optionalDate, param, readBody, requireNumber, requireOneOf, requireString } from '../utils/http.js';
+import type {
+  AttendanceCorrection,
+  AttendanceListResponse,
+  AttendancePagination,
+  AttendanceRecord,
+  AttendanceSnapshot,
+  AttendanceStatus,
+  AttendanceSummary,
+  AttendanceSummaryResponse,
+} from '../utils/types.js';
 
 // Staff attendance: one row per person per day (Asia/Jakarta), with check-in and check-out time.
 // Kasir see and record their own attendance; the Owner sees everyone's and may correct with an audit trail.
@@ -11,6 +20,9 @@ import type { AttendanceCorrection, AttendanceRecord, AttendanceSnapshot } from 
 // Minutes after the shift start before a check-in counts as "Terlambat".
 const LATE_GRACE_MINUTES = 15;
 const DEFAULT_RANGE_DAYS = 30;
+const DEFAULT_PAGE = 1;
+const DEFAULT_PAGE_SIZE = 10;
+const MAX_PAGE_SIZE = 100;
 const TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ATTENDANCE_STATUSES = ['Hadir', 'Terlambat'] as const;
 
@@ -36,6 +48,10 @@ interface CorrectionRow {
   corrected_at: string;
 }
 
+const ATTENDANCE_FROM = `
+    FROM attendance t
+    JOIN staff_accounts a ON a.login_id = t.login_id`;
+
 const SELECT_ATTENDANCE = `
   SELECT t.id, t.login_id, a.name AS staff_name, a.avatar_url,
          to_char(t.work_date, 'YYYY-MM-DD') AS work_date,
@@ -43,8 +59,7 @@ const SELECT_ATTENDANCE = `
          to_char(t.check_out AT TIME ZONE 'Asia/Jakarta', 'HH24:MI') AS check_out,
          round(extract(epoch FROM (t.check_out - t.check_in)) / 60)::int AS duration_minutes,
          t.status
-    FROM attendance t
-    JOIN staff_accounts a ON a.login_id = t.login_id`;
+  ${ATTENDANCE_FROM}`;
 
 const toRecord = (row: AttendanceRow): AttendanceRecord => {
   const role = roleFromLoginId(row.login_id);
@@ -109,25 +124,112 @@ const requireKasir = (session: ReturnType<typeof sessionOf>): void => {
   }
 };
 
-// GET /api/attendance?from=YYYY-MM-DD&to=YYYY-MM-DD — default: the last 30 days.
-export const listAttendance = async (req: Request, res: Response) => {
-  const session = sessionOf(res);
+interface AttendanceFilters {
+  from: string | null;
+  to: string | null;
+  employee: string | null;
+  status: AttendanceStatus | null;
+}
+
+const paginationValue = (value: unknown, label: string, fallback: number, max: number): number =>
+  value === undefined || value === '' ? fallback : requireNumber(value, label, { min: 1, max });
+
+// Escape LIKE wildcards so a typed % or _ is treated as part of the keyword.
+const likePattern = (value: string): string => `%${value.replace(/[\\%_]/g, '\\$&')}%`;
+
+const readAttendanceFilters = (req: Request, session: ReturnType<typeof sessionOf>): AttendanceFilters => {
   const from = optionalDate(req.query.from, 'Tanggal awal');
   const to = optionalDate(req.query.to, 'Tanggal akhir');
   if (from && to && from > to) {
     throw new HttpError(400, 'Tanggal awal tidak boleh setelah tanggal akhir.');
   }
 
-  const params: unknown[] = [from, to, DEFAULT_RANGE_DAYS];
+  const hasEmployee = req.query.employee !== undefined && req.query.employee !== '';
+  const hasStatus = req.query.status !== undefined && req.query.status !== '';
+  if (!isOwner(session) && (hasEmployee || hasStatus)) {
+    throw new HttpError(403, 'Filter karyawan dan status hanya tersedia untuk Owner.');
+  }
+
+  return {
+    from,
+    to,
+    employee: hasEmployee ? requireString(req.query.employee, 'Karyawan', { min: 1, max: 100 }) : null,
+    status: hasStatus ? requireOneOf(req.query.status, ATTENDANCE_STATUSES, 'Status') : null,
+  };
+};
+
+// Shared by the paginated list and the summary count so both use identical filters.
+const whereFor = (
+  session: ReturnType<typeof sessionOf>,
+  filters: AttendanceFilters
+): { where: string; params: unknown[] } => {
+  const params: unknown[] = [filters.from, filters.to, DEFAULT_RANGE_DAYS];
   let where = `WHERE t.work_date >= COALESCE($1::date, (now() AT TIME ZONE 'Asia/Jakarta')::date - $3::int)
-                  AND t.work_date <= COALESCE($2::date, (now() AT TIME ZONE 'Asia/Jakarta')::date)`;
+                 AND t.work_date <= COALESCE($2::date, (now() AT TIME ZONE 'Asia/Jakarta')::date)`;
+
+  // Kasir is always restricted to their own rows; query params cannot widen this.
   if (!isOwner(session)) {
     params.push(session.account.login_id);
     where += ` AND t.login_id = $${params.length}`;
   }
+  if (filters.employee) {
+    params.push(likePattern(filters.employee));
+    where += ` AND (a.name ILIKE $${params.length} ESCAPE E'\\\\' OR t.login_id ILIKE $${params.length} ESCAPE E'\\\\')`;
+  }
+  if (filters.status) {
+    params.push(filters.status);
+    where += ` AND t.status = $${params.length}`;
+  }
 
-  const { rows } = await query<AttendanceRow>(`${SELECT_ATTENDANCE} ${where} ORDER BY t.work_date DESC, t.check_in DESC`, params);
-  res.json({ attendance: rows.map(toRecord) });
+  return { where, params };
+};
+
+// GET /api/attendance?from=&to=&page=1&limit=10&employee=&status= — default: last 30 days, 10 rows.
+export const listAttendance = async (req: Request, res: Response) => {
+  const session = sessionOf(res);
+  const filters = readAttendanceFilters(req, session);
+  const page = paginationValue(req.query.page, 'Halaman', DEFAULT_PAGE, 1_000_000_000);
+  const limit = paginationValue(req.query.limit, 'Limit per halaman', DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+  const { where, params } = whereFor(session, filters);
+
+  const { rows: countRows } = await query<{ total: number }>(
+    `SELECT COUNT(*)::int AS total ${ATTENDANCE_FROM} ${where}`,
+    params
+  );
+  const total = countRows[0]?.total ?? 0;
+
+  const offset = (page - 1) * limit;
+  const dataParams = [...params, limit, offset];
+  const { rows } = await query<AttendanceRow>(
+    `${SELECT_ATTENDANCE} ${where}
+      ORDER BY t.work_date DESC, t.check_in DESC, t.id DESC
+      LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+    dataParams
+  );
+
+  const pagination: AttendancePagination = { page, limit, total, totalPages: Math.ceil(total / limit) };
+  const response: AttendanceListResponse = { attendance: rows.map(toRecord), pagination };
+  res.json(response);
+};
+
+// GET /api/attendance/summary — full filtered counts, never derived from a page slice.
+export const attendanceSummary = async (req: Request, res: Response) => {
+  const session = sessionOf(res);
+  const filters = readAttendanceFilters(req, session);
+  const { where, params } = whereFor(session, filters);
+
+  const { rows } = await query<AttendanceSummary>(
+    `SELECT COUNT(*) FILTER (WHERE t.status = 'Hadir')::int AS hadir,
+            COUNT(*) FILTER (WHERE t.status = 'Terlambat')::int AS terlambat,
+            COUNT(*)::int AS total
+       ${ATTENDANCE_FROM} ${where}`,
+    params
+  );
+
+  const response: AttendanceSummaryResponse = {
+    summary: { hadir: rows[0]?.hadir ?? 0, terlambat: rows[0]?.terlambat ?? 0, total: rows[0]?.total ?? 0 },
+  };
+  res.json(response);
 };
 
 // GET /api/attendance/today — own record for today, or null.

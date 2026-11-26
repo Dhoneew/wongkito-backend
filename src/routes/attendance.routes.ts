@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import {
+  attendanceSummary,
   checkIn,
   checkOut,
   correctAttendance,
@@ -15,6 +16,7 @@ const router = Router();
 
 router.use(requireSession);
 router.get('/', listAttendance);
+router.get('/summary', attendanceSummary);
 router.get('/today', todayAttendance);
 router.post('/check-in', checkIn);
 router.post('/check-out', checkOut);
